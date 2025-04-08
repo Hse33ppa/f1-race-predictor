@@ -1,0 +1,92 @@
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, roc_auc_score
+from imblearn.over_sampling import SMOTE
+from sklearn.preprocessing import OneHotEncoder
+
+# Step 1: Load Data
+# Replace these paths with your actual data files
+race_results = pd.read_csv("f1_race_results.csv")
+driver_standings = pd.read_csv("f1_driver_standings.csv")
+constructor_standings = pd.read_csv("f1_constructor_standings.csv")
+
+# Step 2: Feature Engineering
+# Merge datasets
+data = race_results.merge(driver_standings, on=["raceId", "driverId"])
+data = data.merge(constructor_standings, on=["raceId", "constructorId"])
+
+# Create target variable (1 if driver won the race, 0 otherwise)
+data["target"] = (data["position"] == 1).astype(int)
+
+# Create features
+data["previous_wins"] = data.groupby("driverId")["target"].shift(1).fillna(0).rolling(5, min_periods=1).sum()
+data["circuit_id"] = data["circuitId"].astype(str)  # Convert to string for categorical handling
+
+features = [
+    "driverStandingsPos",  # Driver's championship position
+    "constructorStandingsPos",  # Constructor's championship position
+    "grid",  # Qualifying position
+    "previous_wins",  # Driver's wins in the last 5 races
+    "circuit_id",  # Circuit ID (categorical)
+]
+
+X = data[features].dropna()
+y = data.loc[X.index, "target"]
+
+# One-hot encode categorical features
+encoder = OneHotEncoder(handle_unknown="ignore")
+X_encoded = encoder.fit_transform(X[["circuit_id"]])
+X_encoded_df = pd.DataFrame(X_encoded.toarray(), columns=encoder.get_feature_names_out(["circuit_id"]))
+X = pd.concat([X.drop("circuit_id", axis=1).reset_index(drop=True), X_encoded_df.reset_index(drop=True)], axis=1)
+
+# Step 3: Handle Class Imbalance
+smote = SMOTE(sampling_strategy="minority")
+X_resampled, y_resampled = smote.fit_resample(X, y)
+
+# Step 4: Train the Model
+# Split data
+X_train, X_test, y_train, y_test = train_test_split(X_resampled, y_resampled, test_size=0.2, random_state=42)
+
+# Train XGBoost
+model = xgb.XGBClassifier(
+    objective="binary:logistic",
+    scale_pos_weight=len(y[y == 0]) / len(y[y == 1]),
+    n_estimators=100,
+    max_depth=5,
+    random_state=42
+)
+model.fit(X_train, y_train)
+
+# Evaluate
+y_pred = model.predict(X_test)
+print(f"Accuracy: {accuracy_score(y_test, y_pred):.2f}")
+print(f"ROC-AUC: {roc_auc_score(y_test, y_pred):.2f}")
+
+# Step 5: Predict the Next Race
+# Example: Prepare features for the next race (top 5 drivers)
+next_race_features = pd.DataFrame({
+    "driverStandingsPos": [1, 2, 3, 4, 5],  # Driver standings
+    "constructorStandingsPos": [1, 1, 2, 3, 2],  # Constructor standings
+    "grid": [1, 2, 3, 4, 5],  # Grid position
+    "previous_wins": [5, 3, 2, 1, 0],  # Recent wins
+    "circuit_id": ["10"] * 5  # Circuit ID (replace with actual ID)
+})
+
+# Encode circuit_id
+next_race_encoded = encoder.transform(next_race_features[["circuit_id"]])
+next_race_encoded_df = pd.DataFrame(next_race_encoded.toarray(), columns=encoder.get_feature_names_out(["circuit_id"]))
+next_race_features = pd.concat([
+    next_race_features.drop("circuit_id", axis=1).reset_index(drop=True),
+    next_race_encoded_df.reset_index(drop=True)
+], axis=1)
+
+# Predict probabilities
+probabilities = model.predict_proba(next_race_features)[:, 1]
+driver_names = ["Driver A", "Driver B", "Driver C", "Driver D", "Driver E"]
+
+# Display predictions
+print("\nPredicted probabilities for the next race:")
+for driver, prob in zip(driver_names, probabilities):
+    print(f"{driver}: {prob * 100:.1f}% chance to win")
